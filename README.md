@@ -1,208 +1,133 @@
-# Secure Remote Access to a Local Web App via Cloudflare Tunnel — Windows 11
+# Cloudflare Tunnel for a Local Web App (Windows 11)
 
-![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D6?logo=windows)
-![Cloudflare](https://img.shields.io/badge/Cloudflare-Tunnel%20%2B%20Access-F38020?logo=cloudflare&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-container-2496ED?logo=docker&logoColor=white)
-![Zero Trust](https://img.shields.io/badge/security-Zero%20Trust-000000)
+I run a small web app in Docker on my Windows 11 laptop and needed to reach it from outside. The laptop moves between home Wi-Fi, the office and phone tethering, so port forwarding and a static IP were never an option.
 
-Publish a containerized web application running on a Windows 11 host to the public Internet **without opening router ports, buying a static IP, or exposing the machine** and put an **email-based Zero Trust login** in front of it.
+This repo documents the setup I ended up with: `cloudflared` running as a Windows service, one published hostname, and Cloudflare Access in front of it with email one-time PIN login. The router has no open ports, and the public URL keeps working when the laptop changes networks.
 
-The host is a mobile laptop that changes networks frequently (home Wi‑Fi, office, phone tethering). Because the connector uses an **outbound-only** connection to Cloudflare's edge, the public URL stays reachable regardless of the local WAN IP, and reconnects automatically whenever the network changes.
+## Contents
 
----
+1. [How it works](#how-it-works)
+2. [Requirements](#requirements)
+3. [Create the tunnel](#1-create-the-tunnel)
+4. [Install the connector](#2-install-the-connector-on-windows)
+5. [Publish the app](#3-publish-the-app)
+6. [Restrict access](#4-restrict-access-with-email-otp)
+7. [Enforce JWT validation](#5-enforce-access-jwt-validation)
+8. [Keep it running](#6-keep-it-running)
+9. [Checks](#checks)
+10. [Troubleshooting](#troubleshooting)
+11. [Security notes](#security-notes)
 
-## Table of Contents
-
-- [Architecture](#architecture)
-- [How it solves the dynamic-IP problem](#how-it-solves-the-dynamic-ip-problem)
-- [Prerequisites](#prerequisites)
-- [Part 1 — Cloudflare: create the tunnel](#part-1--cloudflare-create-the-tunnel)
-- [Part 2 — Windows 11: install the connector as a service](#part-2--windows-11-install-the-connector-as-a-service)
-- [Part 3 — Publish the application route](#part-3--publish-the-application-route)
-- [Part 4 — Access control (email one-time PIN)](#part-4--access-control-email-one-time-pin)
-- [Part 5 — Harden: enforce Access JWT validation](#part-5--harden-enforce-access-jwt-validation)
-- [Part 6 — Resilience: survive network changes and sleep](#part-6--resilience-survive-network-changes-and-sleep)
-- [Verification](#verification)
-- [Troubleshooting](#troubleshooting)
-- [Security model](#security-model)
-- [License](#license)
-
----
-
-## Architecture
+## How it works
 
 ```mermaid
 flowchart LR
-    U[User's browser] -->|HTTPS + Access login| CF[Cloudflare Edge<br/>Access + WAF + DDoS]
-    CF -->|outbound-only tunnel| C[cloudflared service<br/>Windows 11 host]
-    C -->|http://localhost:8080| A[Web App<br/>Docker container]
+    U[Browser] -->|HTTPS| CF[Cloudflare edge<br/>Access policy]
+    CF -->|tunnel| C[cloudflared<br/>Windows service]
+    C -->|localhost:8080| A[Web app<br/>Docker]
 
-    subgraph Host [Windows 11 Laptop - dynamic WAN IP]
+    subgraph Laptop [Windows 11 laptop, changing WAN IP]
         C
         A
     end
 ```
 
-Request flow:
+`cloudflared` opens an outbound connection from the laptop to Cloudflare and keeps it open. Requests for `app.example.com` hit Cloudflare first, which checks the Access policy, then travel back down that connection to `cloudflared`, which forwards them to the container on port 8080.
 
-1. A user opens `https://app.example.com`.
-2. Cloudflare intercepts the request at the edge and enforces the **Access** policy (email OTP). Unauthorized users never reach the origin.
-3. Authorized requests are forwarded down the **outbound-only tunnel** to `cloudflared` on the Windows host.
-4. `cloudflared` proxies the request to the container listening on `localhost:8080`.
+The laptop only makes outbound connections, so its public IP doesn't matter. After a network change, `cloudflared` reconnects on its own in a few seconds and the hostname stays the same.
 
-No inbound ports are opened on the router or the host. The only exposed surface is the single published hostname, gated by Access.
+## Requirements
 
----
+- A domain using Cloudflare nameservers (the free plan works)
+- Cloudflare Zero Trust enabled (free tier, `one.dash.cloudflare.com`)
+- Docker Desktop with the app published on port 8080
+- Admin rights on the Windows machine
+- `curl http://localhost:8080` returns the app on the host
 
-## How it solves the dynamic-IP problem
+The tunnel token used below gives control of the connector. Keep it in a password manager and out of the repo, screenshots and issues. I use `<YOUR_TUNNEL_TOKEN>` as a placeholder.
 
-Traditional remote access requires a static public IP and inbound port-forwarding impractical for a laptop that roams between networks. Cloudflare Tunnel inverts the model:
+## 1. Create the tunnel
 
-- `cloudflared` opens a **persistent outbound connection** from the host to Cloudflare.
-- Inbound traffic rides back down that existing connection.
-- When the network changes (new Wi‑Fi, tethering, different WAN IP), the connector detects the drop and **re-establishes the outbound connection automatically**.
+1. In the Zero Trust dashboard, open **Networks > Tunnels > Create a tunnel**.
+2. Pick **Cloudflared** as the connector type.
+3. Give it a name (I used `windows-webapp`) and save.
+4. The next screen shows install commands with the token (a long string starting with `eyJ`). Copy it.
 
-The public hostname never changes. The local IP is irrelevant.
+The token stays the same for the life of the tunnel. You can view it again from the tunnel's **Configure** page or rotate it with **Refresh token**.
 
----
+## 2. Install the connector on Windows
 
-## Prerequisites
+Run `cloudflared` as a service. If you start it with `cloudflared tunnel run` in a terminal, it stops when you close the window or the machine sleeps.
 
-| Requirement | Notes |
-|---|---|
-| A domain on Cloudflare | Nameservers pointing to Cloudflare (free plan is sufficient). Required for Access. |
-| Cloudflare Zero Trust enabled | Free tier. Dashboard: `one.dash.cloudflare.com`. |
-| Docker Desktop for Windows | The web app runs in a container publishing port `8080`. |
-| Windows 11 host | Admin rights (PowerShell as Administrator) to install the service. |
-| The app reachable locally | `curl http://localhost:8080` returns the app on the host. |
-
-> **Security note:** the tunnel **token** grants control over the connector. Treat it like a secret. **Never commit it to a repository, screenshot it publicly, or paste it in issues.** This document uses `<YOUR_TUNNEL_TOKEN>` as a placeholder throughout.
-
----
-
-## Part 1 — Cloudflare: create the tunnel
-
-1. Go to **`one.dash.cloudflare.com`** → **Networks → Tunnels → Create a tunnel**.
-2. Select **Cloudflared** as the connector type.
-3. Name the tunnel (e.g. `windows-webapp`) and save.
-4. On the **Install and run a connector** screen, Cloudflare displays install commands containing the **tunnel token** (a long string starting with `eyJ...`).
-
-**Copy the token now and store it in a password manager.** It is fixed for the life of the tunnel and works on any network. You can retrieve it later via the tunnel's **Configure** page or rotate it with **Refresh token**.
-
----
-
-## Part 2 — Windows 11: install the connector as a service
-
-Installing `cloudflared` as a **Windows service** is what makes the tunnel survive reboots, sleep, and network changes. Running it in an interactive terminal (`cloudflared tunnel run`) is **not** persistent and will drop on network change — do not use that mode for hosting.
-
-### 2.1 Install cloudflared
-
-Open **PowerShell as Administrator** and install via winget:
+In an elevated PowerShell:
 
 ```powershell
 winget install --id Cloudflare.cloudflared
 ```
 
-Close and reopen PowerShell (as Administrator) so the new `PATH` is picked up, then verify:
+Open a new elevated PowerShell so `PATH` updates, then:
 
 ```powershell
 cloudflared --version
-```
-
-### 2.2 Register the service with your token
-
-```powershell
 cloudflared service install <YOUR_TUNNEL_TOKEN>
-```
-
-This registers a Windows service that starts on boot and auto-reconnects.
-
-### 2.3 Confirm the service is running
-
-```powershell
 Get-Service cloudflared
 ```
 
-`Status` should read `Running`. In the Cloudflare dashboard, the tunnel should show **Healthy** and the connector **Connected**.
+`Get-Service` should show `Running`, and the dashboard should list the tunnel as **Healthy**.
 
-> **If reinstalling:** remove any previous service first with `cloudflared service uninstall` (ignore the error if none exists), then run `service install` again.
+To reinstall, run `cloudflared service uninstall` first. It errors if no service exists; ignore that.
 
-> **Docker networking note:** with `cloudflared` installed **natively** on Windows (as above), `localhost:8080` resolves correctly to the container's published port. If you instead run `cloudflared` **inside a container**, `localhost` refers to that container — use `http://host.docker.internal:8080` as the service target instead.
+If you run `cloudflared` in a container instead of on the host, `localhost` points at that container. Use `http://host.docker.internal:8080` as the target in that case.
 
----
+## 3. Publish the app
 
-## Part 3 — Publish the application route
-
-1. Open the tunnel → **Published application routes** tab → **Add a published application route**.
-2. Configure:
+Open the tunnel, go to **Published application routes** and add a route:
 
 | Field | Value |
 |---|---|
-| **Subdomain** | `app` (or your choice) |
-| **Domain** | your Cloudflare domain |
-| **Path** | *(leave empty)* |
-| **Type** | `HTTP` |
-| **URL** | `localhost:8080` |
+| Subdomain | `app` |
+| Domain | your domain |
+| Path | empty |
+| Type | `HTTP` |
+| URL | `localhost:8080` |
 
-3. Save. Cloudflare creates the proxied `CNAME` DNS record automatically.
+Cloudflare creates the proxied CNAME record for you.
 
-> **Common mistake:** `localhost:8080` belongs **only** in the **URL** field under *Service*. Do not enter it in **Path**, **Proxy Type**, or **HTTP Host Header** — doing so produces a `404` (the catch-all `http_status:404` rule takes over). Leave those fields empty. `Path` empty means "match all paths".
+Put `localhost:8080` in the URL field only. I first typed it into Path and got a 404, because the request fell through to the default `http_status:404` rule. An empty Path matches everything.
 
-Test in a private/incognito window:
+Open `https://app.example.com` in a private window. A 502 means the tunnel works but nothing answered on port 8080, so check the container.
 
-```
-https://app.example.com/
-```
+## 4. Restrict access with email OTP
 
-If the app loads, proceed. If you get `502`, the tunnel reached the host but the container did not respond — verify `curl http://localhost:8080` on the host.
+1. Go to **Access > Applications > Add an application > Self-hosted**.
+2. Set the application domain to `app.example.com`.
+3. Add a policy named `Authorized emails`, action **Allow**, and under **Include > Emails** list the addresses you want to let in.
+4. Save.
 
----
+Zero Trust accounts have One-Time PIN enabled by default, so you don't need to configure a login method. Visitors enter their email, receive a code, and get through only if their address is on the list.
 
-## Part 4 — Access control (email one-time PIN)
+## 5. Enforce Access JWT validation
 
-Gate the application so only authorized emails can reach it.
+With this on, `cloudflared` drops any request without a valid Access token. That closes the gap where someone reaches the tunnel without going through Access.
 
-1. Zero Trust → **Access → Applications → Add an application → Self-hosted**.
-2. **Application domain:** `app.example.com` (the same hostname).
-3. Go to **Policies → Add a policy**:
-   - **Policy name:** `Authorized emails`
-   - **Action:** `Allow`
-   - **Include → Emails:** add each authorized address.
-4. Save the application.
+Turn it on after you confirm the email login works, or you will lock yourself out.
 
-**One-Time PIN** is the default, always-on login method for every Zero Trust account — no extra configuration is required. It cannot be disabled or removed.
-
-Result: visitors are challenged with a Cloudflare login screen, enter their email, receive a single-use code, and are admitted only if their address is on the allow-list.
-
----
-
-## Part 5 — Harden: enforce Access JWT validation
-
-Without this, a party who discovers the tunnel URL could theoretically bypass Access by reaching the origin directly. Enabling **JWT validation** makes `cloudflared` reject any request that does not carry a valid Access token — making Access mandatory.
-
-> Enable this **only after** the email login is confirmed working. Enabling it prematurely locks you out.
-
-1. Tunnel → **Published application routes** → edit the route (`...` menu).
+1. Edit the route under **Published application routes**.
 2. Open **Origin request and connection settings**.
-3. Set **Enforce Access JWT validation** → **On**.
-4. In the **Application** selector, choose the Access application created in Part 4.
-5. Save.
+3. Enable **Enforce Access JWT validation** and select the application from step 4.
+4. Save.
 
----
+## 6. Keep it running
 
-## Part 6 — Resilience: survive network changes and sleep
+The service handles reconnects. Two more settings let the laptop host unattended.
 
-The service handles reconnection on network change automatically. Two host-level settings make the deployment fully autonomous.
-
-### 6.1 Keep the container running
-
-Ensure the app restarts on its own after Docker or the host restarts:
+Restart the container automatically:
 
 ```powershell
 docker update --restart unless-stopped <CONTAINER_NAME>
 ```
 
-Or in `docker-compose.yml`:
+or in Compose:
 
 ```yaml
 services:
@@ -212,79 +137,53 @@ services:
       - "8080:8080"
 ```
 
-### 6.2 Prevent the laptop from sleeping while hosting
-
-If the machine suspends, both `cloudflared` and Docker pause. For a hosting laptop, disable sleep (PowerShell as Administrator):
+Stop the laptop from sleeping, including with the lid closed (elevated PowerShell):
 
 ```powershell
-# Never sleep on AC or battery
 powercfg /change standby-timeout-ac 0
 powercfg /change standby-timeout-dc 0
-```
 
-To keep hosting with the lid closed, set the lid-close action to "Do nothing":
-
-```powershell
-# 0 = Do nothing
+# Lid close action: 0 = do nothing
 powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
 powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
 powercfg /setactive SCHEME_CURRENT
 ```
 
-> Alternatively, configure these under **Settings → System → Power** and **Control Panel → Power Options → Choose what closing the lid does**.
+You can set the same options in **Settings > System > Power** and in the classic Power Options panel.
 
----
+## Checks
 
-## Verification
-
-| Check | Command / Action | Expected |
+| Check | How | Expected |
 |---|---|---|
-| Service running | `Get-Service cloudflared` | `Status: Running` |
-| Tunnel healthy | Dashboard → Tunnels | `Healthy` / `Connected` |
-| App reachable locally | `curl http://localhost:8080` | App HTML |
-| Public access + login | Open `https://app.example.com` in incognito | Access email prompt → app |
-| Survives network change | Switch Wi‑Fi ↔ tethering, wait ~30s, reload | App reachable again |
-
----
+| Service | `Get-Service cloudflared` | `Running` |
+| Tunnel | Dashboard > Tunnels | `Healthy` |
+| App on host | `curl http://localhost:8080` | HTML |
+| Public URL | `https://app.example.com` in a private window | Email prompt, then the app |
+| Network change | Switch Wi-Fi to tethering, wait 30 s, reload | App loads |
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Fix |
+| Symptom | Cause | Fix |
 |---|---|---|
-| `HTTP ERROR 404` | `localhost:8080` placed in **Path** / **Proxy Type** instead of **URL** | Clear those fields; keep the value only in Service → URL |
-| `502` / `521` | Container not answering on 8080 | Verify `curl http://localhost:8080`; check `--restart unless-stopped` |
-| `530` / DNS not resolving | Missing or grey-clouded CNAME | Confirm the record is **proxied** in DNS |
-| Drops on network change | Running `cloudflared tunnel run` in a terminal (not a service) | Stop it; run `cloudflared service install <TOKEN>` |
-| App loads but broken (CSS/JS) | App validates the `Host` header | Set **HTTP Host Header** = `localhost:8080` in Origin settings |
-| Service won't install | Stale prior service | `cloudflared service uninstall`, then reinstall |
+| 404 | `localhost:8080` entered in Path or Proxy Type | Clear those fields, keep it only in URL |
+| 502 / 521 | Nothing listening on 8080 | Check the container and its restart policy |
+| 530 or no DNS | CNAME missing or not proxied | Turn on the orange cloud for the record |
+| Drops after a network change | Running `cloudflared tunnel run` in a terminal | Install it as a service |
+| Page loads without CSS/JS | App checks the `Host` header | Set HTTP Host Header to `localhost:8080` in origin settings |
+| Service install fails | Old service still registered | `cloudflared service uninstall`, then install again |
 
-Inspect service logs via **Event Viewer → Windows Logs → Application** (source `cloudflared`), or run `cloudflared tunnel info <tunnel-name>`.
+Logs are in **Event Viewer > Windows Logs > Application** under the `cloudflared` source. `cloudflared tunnel info <name>` shows connector status.
 
----
+## Security notes
 
-## Security model
+The tunnel forwards only the routes you define. With one route to `localhost:8080` and the 404 catch-all, no other port or file on the machine is reachable through it, and a scan of the WAN IP finds nothing open. Access requires the email code, and JWT validation stops anyone from skipping that step.
 
-**What is protected**
+The remaining risk sits in three places:
 
-- The tunnel forwards traffic **only** to the routes you define. The single route (`localhost:8080`) plus the `http_status:404` catch-all means no other port, service, or file on the host is reachable through the tunnel. It is not a general "open door" to the machine.
-- **No inbound ports** are exposed on the router or host — an external scan of the WAN IP sees nothing.
-- **Cloudflare Access** enforces email OTP before any request reaches the origin.
-- **JWT validation** (Part 5) makes Access non-bypassable.
-
-**What still requires care** — the residual risk is not the tunnel exposing the host; it is what lives *behind* port 8080:
-
-1. **The application itself.** Authenticated users have full access to whatever the app on 8080 offers. If the app can read/write arbitrary files or run commands, that capability is reachable. Review the app's own surface.
-2. **The allow-list.** Everyone on the Access email list has real access. Keep it minimal and trusted.
-3. **The token.** Anyone with the tunnel token can run a connector for this tunnel. Store it in a secret manager; rotate via **Refresh token** if exposed.
-
-In short: the operating system, files, and other ports remain protected — the tunnel exposes only port 8080. Operational security reduces to keeping the Access list trusted, enforcing JWT validation, protecting the token, and trusting the published application.
-
----
-
-## License
-
-MIT — see [`LICENSE`](LICENSE).
+- **The app.** Anyone on the allow list can do whatever the app allows. If it can read files or run commands, so can they.
+- **The allow list.** Keep it short.
+- **The token.** Whoever holds it can run a connector for this tunnel. Rotate it if it leaks.
 
 ## Author
 
-Documented and deployed by **Gustavo Carvalho** — Infrastructure & Cloud Operations.
+Gustavo Carvalho, Infrastructure & Cloud Operations
