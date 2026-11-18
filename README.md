@@ -5,7 +5,7 @@
 ![Docker](https://img.shields.io/badge/Docker-container-2496ED?logo=docker&logoColor=white)
 ![Zero Trust](https://img.shields.io/badge/security-Zero%20Trust-000000)
 
-Publish a containerized web application running on a Windows 11 host to the public Internet — **without opening router ports, buying a static IP, or exposing the machine** — and put an **email-based Zero Trust login** in front of it.
+Publish a containerized web application running on a Windows 11 host to the public Internet **without opening router ports, buying a static IP, or exposing the machine** and put an **email-based Zero Trust login** in front of it.
 
 The host is a mobile laptop that changes networks frequently (home Wi‑Fi, office, phone tethering). Because the connector uses an **outbound-only** connection to Cloudflare's edge, the public URL stays reachable regardless of the local WAN IP, and reconnects automatically whenever the network changes.
 
@@ -56,7 +56,7 @@ No inbound ports are opened on the router or the host. The only exposed surface 
 
 ## How it solves the dynamic-IP problem
 
-Traditional remote access requires a static public IP and inbound port-forwarding — impractical for a laptop that roams between networks. Cloudflare Tunnel inverts the model:
+Traditional remote access requires a static public IP and inbound port-forwarding impractical for a laptop that roams between networks. Cloudflare Tunnel inverts the model:
 
 - `cloudflared` opens a **persistent outbound connection** from the host to Cloudflare.
 - Inbound traffic rides back down that existing connection.
